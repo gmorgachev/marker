@@ -127,12 +127,14 @@ def pdf_worker_function(
         # Otherwise, fallback to "cpu".
         num_gpus_local = torch.cuda.device_count()
         if num_gpus_local > 0:
-            device = "cuda:0"
+            device = "cuda"
         else:
             device = "cpu"
 
         config_dict["device"] = device
         config_dict["pdftext_workers"] = pdftext_workers
+        print(f"Using GPU: {device}")
+        print(f"Using PDFText workers: {pdftext_workers}")
 
         converter = PdfConverter(
             config=config_dict,
