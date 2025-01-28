@@ -20,6 +20,7 @@ from marker.output import text_from_rendered
 from marker.converters.pdf import PdfConverter
 from marker.models import create_model_dict
 from marker.settings import settings
+from fastapi.concurrency import run_in_threadpool
 
 app = FastAPI()
 UPLOAD_DIRECTORY = "./uploads"
@@ -175,11 +176,14 @@ async def convert_pdf_upload(
     output_format: Optional[str] = Form(default="markdown"),
     file: UploadFile = File(..., description="PDF file", media_type="application/pdf"),
 ):
+    print(f"Uploading file: {file.filename}")
     upload_path = os.path.join(UPLOAD_DIRECTORY, file.filename)
     with open(upload_path, "wb+") as out_file:
         out_file.write(await file.read())
 
     gpu_id = next(gpu_indices) if torch.cuda.device_count() > 0 else 0
+    print(f"Using GPU: {gpu_id}")
+    print(f"Using PDFText workers: {pdftext_workers}")
 
     future: Future = executor.submit(
         pdf_worker_function,
@@ -192,7 +196,7 @@ async def convert_pdf_upload(
         gpu_id,
         pdftext_workers,
     )
-    result = future.result()
+    result = await run_in_threadpool(future.result)
 
     os.remove(upload_path)
     return result
