@@ -1,5 +1,6 @@
 import multiprocessing as mp
 import os
+from tempfile import NamedTemporaryFile
 
 from fastapi import FastAPI, Form, File, UploadFile
 from fastapi.responses import HTMLResponse
@@ -208,13 +209,13 @@ async def convert_pdf_upload(
     output_format: Optional[str] = Form(default="markdown"),
     file: UploadFile = File(..., description="PDF file", media_type="application/pdf"),
 ):
-    upload_path = os.path.join(UPLOAD_DIRECTORY, file.filename)
-    with open(upload_path, "wb") as out_file:
-        out_file.write(await file.read())
+    with NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
+        temp_file.write(await file.read())
+        temp_file_path = temp_file.name
 
     future: Future = executor.submit(
         pdf_worker_function,
-        upload_path,
+        temp_file_path,
         page_range,
         languages,
         force_ocr,
@@ -223,7 +224,7 @@ async def convert_pdf_upload(
         pdftext_workers
     )
     result = await run_in_threadpool(future.result)
-    os.remove(upload_path)
+    os.remove(temp_file_path)
     return result
 
 
