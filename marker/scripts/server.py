@@ -2,9 +2,6 @@ import os
 import multiprocessing as mp
 from tempfile import NamedTemporaryFile
 from typing import Optional, Annotated
-import base64
-import io
-import traceback
 
 import click
 import uvicorn
@@ -21,18 +18,26 @@ pool = None  # We'll create an mp.Pool in main(), with maxtasksperchild=1
 pdftext_workers = 1
 
 # ------------------------------------------------------------------------------
-# PIN EACH CHILD PROCESS TO ONE GPU
+# PIN EACH CHILD PROCESS TO ONE GPU (with fallback)
 # ------------------------------------------------------------------------------
 def pin_to_one_gpu(gpu_ids):
     """
     Each child process runs this once. We decide which GPU to use
     by the child's worker ID => index into gpu_ids.
-    Then set CUDA_VISIBLE_DEVICES to that single GPU.
+    If worker_id >= len(gpu_ids), fallback to CPU (no GPU).
     """
     worker_id = mp.current_process()._identity[0] - 1
-    chosen_gpu = gpu_ids[worker_id]
-    os.environ["CUDA_VISIBLE_DEVICES"] = chosen_gpu
-    print(f"[Child pid={os.getpid()}] pinned to GPU {chosen_gpu} (CUDA_VISIBLE_DEVICES={chosen_gpu})")
+    if worker_id < len(gpu_ids):
+        chosen_gpu = gpu_ids[worker_id]
+        os.environ["CUDA_VISIBLE_DEVICES"] = chosen_gpu
+        print(
+            f"[Child pid={os.getpid()}] pinned to GPU {chosen_gpu} "
+            f"(CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']})"
+        )
+    else:
+        # Fallback if there aren't enough GPUs for all processes
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        print(f"[Child pid={os.getpid()}] No GPU assigned, fallback to CPU.")
 
 # ------------------------------------------------------------------------------
 # CHILD WORKER FUNCTION
@@ -47,10 +52,14 @@ def pdf_worker_function(
     pdftext_workers: int
 ):
     """
-    Runs in a child process pinned to exactly 1 GPU.
+    Runs in a child process pinned to exactly 1 GPU if available.
     Because maxtasksperchild=1, the process is killed after 1 PDF => frees GPU memory.
     """
-    # Lazy import so the parent never initializes CUDA
+    import io
+    import traceback
+    import base64
+
+    # Lazy import so the parent never initializes CUDA or marker's GPU code
     import torch
     from marker.config.parser import ConfigParser
     from marker.output import text_from_rendered
@@ -59,7 +68,7 @@ def pdf_worker_function(
     from marker.settings import settings
 
     try:
-        # Clear any leftover GPU cache
+        # Clear leftover GPU cache
         torch.cuda.empty_cache()
 
         artifact_dict = create_model_dict()
@@ -74,19 +83,22 @@ def pdf_worker_function(
         })
         config_dict = config_parser.generate_config_dict()
 
-        # We should see exactly 1 GPU if pinned, else 0 => use CPU
+        # If pinned to a single GPU, torch.cuda.device_count() == 1; else 0 => CPU
         num_gpus_local = torch.cuda.device_count()
         device = "cuda" if num_gpus_local > 0 else "cpu"
         config_dict["device"] = device
         config_dict["pdftext_workers"] = pdftext_workers
 
-        print(f"[Child pid={os.getpid()}] device={device}, pdftext_workers={pdftext_workers}, file={filepath}")
+        print(
+            f"[Child pid={os.getpid()}] device={device}, "
+            f"pdftext_workers={pdftext_workers}, file={filepath}"
+        )
 
         converter = PdfConverter(
             config=config_dict,
             artifact_dict=artifact_dict,
             processor_list=config_parser.get_processors(),
-            renderer=config_parser.get_renderer()
+            renderer=config_parser.get_renderer(),
         )
 
         rendered = converter(filepath)
@@ -118,7 +130,10 @@ def pdf_worker_function(
 # FASTAPI MODELS
 # ------------------------------------------------------------------------------
 class CommonParams(BaseModel):
-    filepath: Annotated[Optional[str], Field(description="Path to the PDF file.")] = None
+    filepath: Annotated[
+        Optional[str],
+        Field(description="Path to the PDF file if already on disk."),
+    ] = None
     page_range: Optional[str] = None
     languages: Optional[str] = None
     force_ocr: bool = False
@@ -130,13 +145,15 @@ class CommonParams(BaseModel):
 # ------------------------------------------------------------------------------
 @app.get("/")
 def root():
-    return HTMLResponse("<h1>Marker API - Kill Worker After Each PDF</h1><p>Check /docs</p>")
+    return HTMLResponse(
+        "<h1>Marker API - Kill Worker After Each PDF (Robust)</h1>"
+        "<p>Check /docs</p>"
+    )
 
 @app.post("/marker")
 async def convert_pdf(params: CommonParams):
     """
-    Single request for local file.
-    Wait for the PDF job to finish => return result.
+    Single request for local file (filepath). Wait for job => return result.
     Kills the worker afterwards => frees GPU memory.
     """
     if not params.filepath:
@@ -152,10 +169,10 @@ async def convert_pdf(params: CommonParams):
             params.force_ocr,
             params.paginate_output,
             params.output_format,
-            pdftext_workers
-        )
+            pdftext_workers,
+        ),
     )
-    # Wait for the result in a background thread (not to block event loop)
+    # Wait for the result in a background thread (non-blocking event loop)
     result = await run_in_threadpool(async_result.get)
     return result
 
@@ -169,9 +186,11 @@ async def convert_pdf_upload(
     file: UploadFile = File(..., description="PDF file", media_type="application/pdf"),
 ):
     """
-    Upload a file, store in temp, process in the pool,
-    block until done, kill worker => free GPU.
+    Upload a file, store in temp, process in the pool, block until done,
+    kill worker => free GPU, fallback to CPU if we exceed GPU count.
     """
+    from tempfile import NamedTemporaryFile
+
     with NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
         temp_file.write(await file.read())
         temp_path = temp_file.name
@@ -186,7 +205,7 @@ async def convert_pdf_upload(
                 force_ocr,
                 paginate_output,
                 output_format,
-                pdftext_workers
+                pdftext_workers,
             )
         )
         result = await run_in_threadpool(async_result.get)
@@ -215,27 +234,25 @@ if __name__ == "__main__":
     device_str = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     gpu_list = [s.strip() for s in device_str.split(",") if s.strip()]
     num_gpus = len(gpu_list)
-
     if num_gpus == 0:
-        # CPU-only fallback
-        print("No visible GPUs, using CPU worker only")
+        print("No visible GPUs => CPU-only fallback.")
         num_gpus = 1
         gpu_list = []
-    else:
-        print(f"Parent sees GPU IDs: {gpu_list}")
 
-    # Number of parallel text workers inside marker
+    print(f"Detected GPUs in parent env: {gpu_list} (count={len(gpu_list)})")
+
+    # 3. pdftext_workers from env
     pdftext_workers = int(os.environ.get("NUM_WORKERS", "1"))
     print(f"pdftext_workers={pdftext_workers}")
 
-    # 3. Create a pool => 1 process per GPU, kill after each PDF
-    print(f"Creating Pool with {num_gpus} processes, maxtasksperchild=1")
+    # 4. Create mp.Pool => 1 child per GPU. If more processes spawn => fallback CPU
+    print(f"Creating Pool with {num_gpus} process(es). maxtasksperchild=1")
     pool = mp.Pool(
         processes=num_gpus,
         initializer=pin_to_one_gpu,
         initargs=(gpu_list,),
-        maxtasksperchild=1
+        maxtasksperchild=1  # kill after 1 PDF => free GPU memory
     )
 
-    # 4. Start server
+    # 5. Launch the server (recommend --workers=1)
     server_cli()
