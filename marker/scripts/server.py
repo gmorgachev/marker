@@ -1,56 +1,70 @@
+import multiprocessing as mp
 import os
 import io
 import base64
 import traceback
-
-import torch  # used just to count GPUs
+import torch
 from fastapi import FastAPI, Form, File, UploadFile
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from typing import Optional, Annotated
-
-from marker.config.parser import ConfigParser
-from marker.output import text_from_rendered
-from marker.converters.pdf import PdfConverter
-from marker.models import create_model_dict
-from marker.settings import settings
-
 import click
 import uvicorn
 
 from concurrent.futures import ProcessPoolExecutor, Future
 from itertools import cycle
 
-################################################################################
-# GLOBAL SETUP
-################################################################################
+# marker imports
+from marker.config.parser import ConfigParser
+from marker.output import text_from_rendered
+from marker.converters.pdf import PdfConverter
+from marker.models import create_model_dict
+from marker.settings import settings
 
-# 1) Detect the number of visible GPUs.
-num_gpus = torch.cuda.device_count()
-if num_gpus == 0:
-    print("No GPUs found. If you intended to use GPUs, check your CUDA setup.")
-else:
-    print(f"Found {num_gpus} visible GPU(s).")
-
-# 2) Create a process pool of size = number of GPUs (or at least 1 if no GPU).
-#    If no GPU is found, we can decide to use 1 or more CPU processes.
-pool_size = num_gpus if num_gpus > 0 else 1
-print(f"Creating ProcessPoolExecutor with {pool_size} worker(s).")
-executor = ProcessPoolExecutor(max_workers=pool_size)
-
-# 3) Round-robin cycle over GPU indices. If no GPU, this will just use [0].
-gpu_indices = cycle(range(num_gpus))  # e.g. 0,1,0,1... if 2 GPUs
-
-# 4) The number of PDF-text workers from env, default 1 if not set
-pdftext_workers = int(os.environ.get("NUM_WORKERS", "1"))
-print(f"Will set config_dict['pdftext_workers'] to {pdftext_workers}.")
-
-# If you maintain any global models, they need to be re-initialized
-# inside each process. So we won't load them here, but inside the worker function.
-
+app = FastAPI()
+UPLOAD_DIRECTORY = "./uploads"
+os.makedirs(UPLOAD_DIRECTORY, exist_ok=True)
 
 ################################################################################
-# THE "WORKER" FUNCTION FOR PDF CONVERSION
+# Move GPU-using logic into a guarded function
+################################################################################
+
+def setup_multiprocessing():
+    """
+    Called inside 'if __name__ == "__main__":' to set spawn start method
+    and create the process pool, among other global variables.
+    Returns a tuple (executor, gpu_indices, pdftext_workers).
+    """
+    mp.set_start_method("spawn", force=True)  # <--- KEY LINE
+
+    # Now we can safely do torch-related stuff
+    num_gpus = torch.cuda.device_count()
+    if num_gpus == 0:
+        print("No GPUs found. If you intended to use GPUs, check CUDA setup.")
+    else:
+        print(f"Found {num_gpus} visible GPU(s).")
+
+    # Create process pool
+    pool_size = num_gpus if num_gpus > 0 else 1
+    print(f"Creating ProcessPoolExecutor with {pool_size} worker(s).")
+    executor = ProcessPoolExecutor(max_workers=pool_size)
+
+    # Round-robin cycle over GPU indices
+    gpu_indices = cycle(range(num_gpus))  # e.g. 0,1,0,1... if 2 GPUs
+
+    # Number of PDF-text workers from env
+    pdftext_workers = int(os.environ.get("NUM_WORKERS", "1"))
+    print(f"Will set config_dict['pdftext_workers'] to {pdftext_workers}.")
+
+    return executor, gpu_indices, pdftext_workers
+
+# We'll define placeholders to be filled in at runtime.
+executor = None
+gpu_indices = None
+pdftext_workers = 1
+
+################################################################################
+# Worker function
 ################################################################################
 
 def pdf_worker_function(
@@ -63,20 +77,10 @@ def pdf_worker_function(
     gpu_id: int,
     pdftext_workers: int
 ):
-    """
-    Runs in a separate process. We'll do the actual marker -> PDFConverter steps here.
-    We assume PdfConverter or underlying code can accept 'device' or something similar.
-    """
-
+    # Child process logic
     try:
-        # Re-create the necessary data structures in each process
-        # (if your library requires global initialization, do it here).
-        # For example:
         artifact_dict = create_model_dict()
-        
-        # Build config dict using the same logic as your original `_convert_pdf`.
-        # The "device" key is hypothetical — depends on PdfConverter or your OCR library.
-        # Also set the pdftext_workers from the environment or a config var.
+
         config_parser = ConfigParser(
             {
                 "filepath": filepath,
@@ -88,7 +92,15 @@ def pdf_worker_function(
             }
         )
         config_dict = config_parser.generate_config_dict()
-        config_dict["device"] = f"cuda:{gpu_id}" if num_gpus > 0 else "cpu"
+
+        # Use the GPU in child
+        num_gpus_local = torch.cuda.device_count()
+        if num_gpus_local > 0:
+            device = f"cuda:{gpu_id}" 
+        else:
+            device = "cpu"
+
+        config_dict["device"] = device
         config_dict["pdftext_workers"] = pdftext_workers
 
         converter = PdfConverter(
@@ -102,7 +114,6 @@ def pdf_worker_function(
         text, _, images = text_from_rendered(rendered)
         metadata = rendered.metadata
 
-        # Convert images to base64
         encoded_images = {}
         for k, v in images.items():
             byte_stream = io.BytesIO()
@@ -121,78 +132,27 @@ def pdf_worker_function(
 
     except Exception as e:
         traceback.print_exc()
-        return {
-            "success": False,
-            "error": str(e),
-        }
-
+        return {"success": False, "error": str(e)}
 
 ################################################################################
-# FASTAPI APP
+# FastAPI endpoints
 ################################################################################
-
-app = FastAPI()
-
-UPLOAD_DIRECTORY = "./uploads"
-os.makedirs(UPLOAD_DIRECTORY, exist_ok=True)
-
-
-@app.get("/")
-async def root():
-    return HTMLResponse(
-        """
-<h1>Marker API (Multi-GPU Example)</h1>
-<ul>
-    <li><a href="/docs">API Documentation</a></li>
-    <li><a href="/marker">Run marker (post request only)</a></li>
-</ul>
-"""
-    )
-
 
 class CommonParams(BaseModel):
-    filepath: Annotated[
-        Optional[str], Field(description="Path to the PDF file.")
-    ]
-    page_range: Annotated[
-        Optional[str],
-        Field(description="Comma-separated page numbers or ranges. Example: 0,5-10,20"),
-    ] = None
-    languages: Annotated[
-        Optional[str],
-        Field(description="Comma-separated list of languages for OCR."),
-    ] = None
-    force_ocr: Annotated[
-        bool,
-        Field(description="Force OCR on all pages. Defaults to False."),
-    ] = False
-    paginate_output: Annotated[
-        bool,
-        Field(
-            description=(
-                "If True, separates each page in the output with a marker. Defaults False."
-            )
-        ),
-    ] = False
-    output_format: Annotated[
-        str,
-        Field(description="Output format: 'markdown', 'json', or 'html'. Default = markdown."),
-    ] = "markdown"
-
+    filepath: Annotated[Optional[str], Field(description="Path to the PDF file.")]
+    page_range: Annotated[Optional[str], Field(description="Comma-separated pages/ranges")] = None
+    languages: Annotated[Optional[str], Field(description="Comma-separated OCR languages.")] = None
+    force_ocr: Annotated[bool, Field(description="Force OCR on all pages.")] = False
+    paginate_output: Annotated[bool, Field(description="Separate each page in output.")] = False
+    output_format: Annotated[str, Field(description="Output format.")] = "markdown"
 
 @app.post("/marker")
 async def convert_pdf(params: CommonParams):
-    """
-    If 'filepath' is provided, we read that local file directly.
-    This endpoint runs the job in a separate process (one per GPU).
-    """
     if not params.filepath:
         return {"success": False, "error": "No filepath given."}
 
-    # Pick the next GPU from the round-robin
-    gpu_id = next(gpu_indices) if num_gpus > 0 else 0
+    gpu_id = next(gpu_indices) if torch.cuda.device_count() > 0 else 0
 
-    # Schedule the task to the process pool
     future: Future = executor.submit(
         pdf_worker_function,
         params.filepath,
@@ -204,12 +164,7 @@ async def convert_pdf(params: CommonParams):
         gpu_id,
         pdftext_workers,
     )
-
-    # Wait for the result
-    result = future.result()
-
-    return result
-
+    return future.result()
 
 @app.post("/marker/upload")
 async def convert_pdf_upload(
@@ -218,21 +173,14 @@ async def convert_pdf_upload(
     force_ocr: Optional[bool] = Form(default=False),
     paginate_output: Optional[bool] = Form(default=False),
     output_format: Optional[str] = Form(default="markdown"),
-    file: UploadFile = File(..., description="PDF file to convert", media_type="application/pdf"),
+    file: UploadFile = File(..., description="PDF file", media_type="application/pdf"),
 ):
-    """
-    Same as above, but we handle an uploaded file. We'll save it to disk, schedule the job,
-    then remove it.
-    """
     upload_path = os.path.join(UPLOAD_DIRECTORY, file.filename)
-    with open(upload_path, "wb+") as upload_file:
-        contents = await file.read()
-        upload_file.write(contents)
+    with open(upload_path, "wb+") as out_file:
+        out_file.write(await file.read())
 
-    # Pick GPU in round-robin
-    gpu_id = next(gpu_indices) if num_gpus > 0 else 0
+    gpu_id = next(gpu_indices) if torch.cuda.device_count() > 0 else 0
 
-    # Dispatch to pool
     future: Future = executor.submit(
         pdf_worker_function,
         upload_path,
@@ -244,17 +192,17 @@ async def convert_pdf_upload(
         gpu_id,
         pdftext_workers,
     )
-
     result = future.result()
 
-    # Remove the uploaded file after processing
     os.remove(upload_path)
-
     return result
 
+@app.get("/")
+async def root():
+    return HTMLResponse("<h1>Marker API with Spawn</h1><p>Check /docs</p>")
 
 ################################################################################
-# CLI Entry Point (if desired)
+# CLI Entry
 ################################################################################
 
 @click.command()
@@ -263,6 +211,9 @@ async def convert_pdf_upload(
 def server_cli(port: int, host: str):
     uvicorn.run(app, host=host, port=port)
 
-
 if __name__ == "__main__":
+    # 1) Initialize spawn start method and multiprocess resources
+    executor, gpu_indices, pdftext_workers = setup_multiprocessing()
+
+    # 2) Run the CLI
     server_cli()
