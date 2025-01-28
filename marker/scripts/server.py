@@ -1,90 +1,41 @@
-import multiprocessing as mp
 import os
+import multiprocessing as mp
 from tempfile import NamedTemporaryFile
+from typing import Optional, Annotated
+import base64
+import io
+import traceback
 
+import click
+import uvicorn
 from fastapi import FastAPI, Form, File, UploadFile
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
-from typing import Optional, Annotated
-import click
-import uvicorn
-
-from concurrent.futures import ProcessPoolExecutor, Future
 from fastapi.concurrency import run_in_threadpool
 
 # ------------------------------------------------------------------------------
-# FASTAPI APP SETUP (No GPU imports globally)
+# GLOBALS
 # ------------------------------------------------------------------------------
 app = FastAPI()
-UPLOAD_DIRECTORY = "./uploads"
-os.makedirs(UPLOAD_DIRECTORY, exist_ok=True)
-
-executor = None  # Will be set in main() block
-pdftext_workers = 1  # Also set in main() block
+pool = None  # We'll create an mp.Pool in main(), with maxtasksperchild=1
+pdftext_workers = 1
 
 # ------------------------------------------------------------------------------
-# WORKER INITIALIZER
+# PIN EACH CHILD PROCESS TO ONE GPU
 # ------------------------------------------------------------------------------
-def worker_initializer(gpu_ids):
+def pin_to_one_gpu(gpu_ids):
     """
-    Runs in each child process *once*. We figure out which worker index we are,
-    pick one GPU ID, then set `CUDA_VISIBLE_DEVICES` to that single ID.
-    After that, the child sees only that one physical GPU.
+    Each child process runs this once. We decide which GPU to use
+    by the child's worker ID => index into gpu_ids.
+    Then set CUDA_VISIBLE_DEVICES to that single GPU.
     """
     worker_id = mp.current_process()._identity[0] - 1
-    physical_gpu_id = gpu_ids[worker_id]  # e.g. "1" or "2" or "3"
-    
-    os.environ["CUDA_VISIBLE_DEVICES"] = physical_gpu_id
-    print(
-        f"[Child pid={os.getpid()}] Assigned physical GPU: {physical_gpu_id} | "
-        f"CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}"
-    )
+    chosen_gpu = gpu_ids[worker_id]
+    os.environ["CUDA_VISIBLE_DEVICES"] = chosen_gpu
+    print(f"[Child pid={os.getpid()}] pinned to GPU {chosen_gpu} (CUDA_VISIBLE_DEVICES={chosen_gpu})")
 
 # ------------------------------------------------------------------------------
-# SETUP MULTIPROCESSING (Called in __main__)
-# ------------------------------------------------------------------------------
-def setup_multiprocessing():
-    """
-    - Use 'spawn' start method to avoid CUDA init conflicts.
-    - Parse parent's CUDA_VISIBLE_DEVICES (like "1,2,3") -> create one process per device.
-    - Return an executor pinned to those devices.
-    """
-    mp.set_start_method("spawn", force=True)
-
-    device_str = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-    gpu_list = [s.strip() for s in device_str.split(",") if s.strip()]
-    num_gpus = len(gpu_list)
-    if num_gpus == 0:
-        # Means user didn't set CUDA_VISIBLE_DEVICES or set it to empty
-        # => no visible GPUs, fallback to CPU
-        gpu_list = []
-        num_gpus = 1
-        print("No GPUs found in parent's CUDA_VISIBLE_DEVICES, using CPU-only worker.")
-    else:
-        print(f"Parent sees these GPU IDs in CUDA_VISIBLE_DEVICES={gpu_list}")
-
-    pool_size = num_gpus
-    print(f"Creating ProcessPoolExecutor with {pool_size} workers.")
-
-    pdf_workers_env = int(os.environ.get("NUM_WORKERS", "1"))
-    print(f"Setting 'pdftext_workers' to {pdf_workers_env}")
-
-    if num_gpus > 0:
-        # We'll create one child process per GPU ID
-        # Each child sets its own CUDA_VISIBLE_DEVICES
-        proc_pool = ProcessPoolExecutor(
-            max_workers=pool_size,
-            initializer=worker_initializer,
-            initargs=(gpu_list,),
-        )
-    else:
-        # If no GPUs, just do a single worker, CPU only
-        proc_pool = ProcessPoolExecutor(max_workers=1)
-
-    return proc_pool, pdf_workers_env
-
-# ------------------------------------------------------------------------------
-# WORKER FUNCTION: LAZY IMPORT GPU LIBS + MARKER
+# CHILD WORKER FUNCTION
 # ------------------------------------------------------------------------------
 def pdf_worker_function(
     filepath: str,
@@ -96,21 +47,21 @@ def pdf_worker_function(
     pdftext_workers: int
 ):
     """
-    This runs in a child process. We do a LAZY IMPORT of `torch` and `marker.*`
-    so that CUDA is initialized only under the single-GPU environment.
+    Runs in a child process pinned to exactly 1 GPU.
+    Because maxtasksperchild=1, the process is killed after 1 PDF => frees GPU memory.
     """
-    # LAZY import everything that might init the GPU
+    # Lazy import so the parent never initializes CUDA
     import torch
     from marker.config.parser import ConfigParser
     from marker.output import text_from_rendered
     from marker.converters.pdf import PdfConverter
     from marker.models import create_model_dict
     from marker.settings import settings
-    import io
-    import base64
-    import traceback
 
     try:
+        # Clear any leftover GPU cache
+        torch.cuda.empty_cache()
+
         artifact_dict = create_model_dict()
 
         config_parser = ConfigParser({
@@ -123,31 +74,26 @@ def pdf_worker_function(
         })
         config_dict = config_parser.generate_config_dict()
 
-        # If there's exactly one visible GPU (because CUDA_VISIBLE_DEVICES=some_id),
-        # torch.cuda.device_count() should be 1 => device="cuda:0"
-        # Otherwise, fallback to "cpu".
+        # We should see exactly 1 GPU if pinned, else 0 => use CPU
         num_gpus_local = torch.cuda.device_count()
-        if num_gpus_local > 0:
-            device = "cuda"
-        else:
-            device = "cpu"
-
+        device = "cuda" if num_gpus_local > 0 else "cpu"
         config_dict["device"] = device
         config_dict["pdftext_workers"] = pdftext_workers
-        print(f"Using GPU: {device}")
-        print(f"Using PDFText workers: {pdftext_workers}")
+
+        print(f"[Child pid={os.getpid()}] device={device}, pdftext_workers={pdftext_workers}, file={filepath}")
 
         converter = PdfConverter(
             config=config_dict,
             artifact_dict=artifact_dict,
             processor_list=config_parser.get_processors(),
-            renderer=config_parser.get_renderer(),
+            renderer=config_parser.get_renderer()
         )
 
         rendered = converter(filepath)
         text, _, images = text_from_rendered(rendered)
         metadata = rendered.metadata
 
+        # Convert images to base64
         encoded_images = {}
         for k, v in images.items():
             byte_stream = io.BytesIO()
@@ -157,11 +103,11 @@ def pdf_worker_function(
             )
 
         return {
+            "success": True,
             "format": output_format,
             "output": text,
             "images": encoded_images,
             "metadata": metadata,
-            "success": True,
         }
 
     except Exception as e:
@@ -169,36 +115,49 @@ def pdf_worker_function(
         return {"success": False, "error": str(e)}
 
 # ------------------------------------------------------------------------------
-# FASTAPI ENDPOINTS
+# FASTAPI MODELS
 # ------------------------------------------------------------------------------
 class CommonParams(BaseModel):
-    filepath: Annotated[Optional[str], Field(description="Path to the PDF file.")]
-    page_range: Annotated[Optional[str], Field(...)] = None
-    languages: Annotated[Optional[str], Field(...)] = None
-    force_ocr: Annotated[bool, Field(...)] = False
-    paginate_output: Annotated[bool, Field(...)] = False
-    output_format: Annotated[str, Field(...)] = "markdown"
+    filepath: Annotated[Optional[str], Field(description="Path to the PDF file.")] = None
+    page_range: Optional[str] = None
+    languages: Optional[str] = None
+    force_ocr: bool = False
+    paginate_output: bool = False
+    output_format: str = "markdown"
 
+# ------------------------------------------------------------------------------
+# ENDPOINTS
+# ------------------------------------------------------------------------------
+@app.get("/")
+def root():
+    return HTMLResponse("<h1>Marker API - Kill Worker After Each PDF</h1><p>Check /docs</p>")
 
 @app.post("/marker")
 async def convert_pdf(params: CommonParams):
+    """
+    Single request for local file.
+    Wait for the PDF job to finish => return result.
+    Kills the worker afterwards => frees GPU memory.
+    """
     if not params.filepath:
-        return {"success": False, "error": "No filepath given."}
+        return {"success": False, "error": "No filepath given"}
 
-    future: Future = executor.submit(
+    # Submit a job to the pool
+    async_result = pool.apply_async(
         pdf_worker_function,
-        params.filepath,
-        params.page_range,
-        params.languages,
-        params.force_ocr,
-        params.paginate_output,
-        params.output_format,
-        pdftext_workers
+        (
+            params.filepath,
+            params.page_range,
+            params.languages,
+            params.force_ocr,
+            params.paginate_output,
+            params.output_format,
+            pdftext_workers
+        )
     )
-    # Avoid blocking event loop by using run_in_threadpool
-    result = await run_in_threadpool(future.result)
+    # Wait for the result in a background thread (not to block event loop)
+    result = await run_in_threadpool(async_result.get)
     return result
-
 
 @app.post("/marker/upload")
 async def convert_pdf_upload(
@@ -209,32 +168,35 @@ async def convert_pdf_upload(
     output_format: Optional[str] = Form(default="markdown"),
     file: UploadFile = File(..., description="PDF file", media_type="application/pdf"),
 ):
+    """
+    Upload a file, store in temp, process in the pool,
+    block until done, kill worker => free GPU.
+    """
     with NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
         temp_file.write(await file.read())
-        temp_file_path = temp_file.name
+        temp_path = temp_file.name
 
-    future: Future = executor.submit(
-        pdf_worker_function,
-        temp_file_path,
-        page_range,
-        languages,
-        force_ocr,
-        paginate_output,
-        output_format,
-        pdftext_workers
-    )
-    result = await run_in_threadpool(future.result)
-    os.remove(temp_file_path)
+    try:
+        async_result = pool.apply_async(
+            pdf_worker_function,
+            (
+                temp_path,
+                page_range,
+                languages,
+                force_ocr,
+                paginate_output,
+                output_format,
+                pdftext_workers
+            )
+        )
+        result = await run_in_threadpool(async_result.get)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
     return result
 
-
-@app.get("/")
-async def root():
-    return HTMLResponse("<h1>Marker API - pinned GPUs</h1><p>Check /docs</p>")
-
-
 # ------------------------------------------------------------------------------
-# CLI ENTRY
+# CLI
 # ------------------------------------------------------------------------------
 @click.command()
 @click.option("--port", type=int, default=6666, help="Port to run the server on")
@@ -242,7 +204,38 @@ async def root():
 def server_cli(port: int, host: str):
     uvicorn.run(app, host=host, port=port)
 
-
+# ------------------------------------------------------------------------------
+# MAIN
+# ------------------------------------------------------------------------------
 if __name__ == "__main__":
-    executor, pdftext_workers = setup_multiprocessing()
+    # 1. Force spawn to avoid CUDA re-init errors
+    mp.set_start_method("spawn", force=True)
+
+    # 2. Parse parent's CUDA_VISIBLE_DEVICES => e.g. "1,2,3"
+    device_str = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    gpu_list = [s.strip() for s in device_str.split(",") if s.strip()]
+    num_gpus = len(gpu_list)
+
+    if num_gpus == 0:
+        # CPU-only fallback
+        print("No visible GPUs, using CPU worker only")
+        num_gpus = 1
+        gpu_list = []
+    else:
+        print(f"Parent sees GPU IDs: {gpu_list}")
+
+    # Number of parallel text workers inside marker
+    pdftext_workers = int(os.environ.get("NUM_WORKERS", "1"))
+    print(f"pdftext_workers={pdftext_workers}")
+
+    # 3. Create a pool => 1 process per GPU, kill after each PDF
+    print(f"Creating Pool with {num_gpus} processes, maxtasksperchild=1")
+    pool = mp.Pool(
+        processes=num_gpus,
+        initializer=pin_to_one_gpu,
+        initargs=(gpu_list,),
+        maxtasksperchild=1
+    )
+
+    # 4. Start server
     server_cli()
